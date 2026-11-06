@@ -1,0 +1,193 @@
+"""Save every figure of an executed notebook as JPG, plus a numbered full-resolution pit map with tehsil and
+village boundaries, registered ponds, canals, main roads and a latitude / longitude grid, coordinate tables of the new and the largest pits, and a
+pits-per-tehsil table.
+
+usage: python export_jpgs.py executed.ipynb pit_outputs/<run> jpg_folder [boundaries_folder]
+       (boundaries_folder defaults to the repository's data/ folder)
+"""
+import base64
+import io
+import json
+import re
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.patheffects as effects
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import rasterio
+from PIL import Image
+from pyproj import Transformer
+
+notebook, run_dir, out_dir = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+boundary_dir = Path(sys.argv[4]) if len(sys.argv) > 4 else Path(__file__).resolve().parent.parent / 'data'
+out_dir.mkdir(parents=True, exist_ok=True)
+district = run_dir.name.split('_')[0]
+admin = {level: gpd.read_file(boundary_dir / f'{district}_{level}s.geojson')
+         for level in ('tehsil', 'village', 'hsac_pond', 'road', 'canal')
+         if (boundary_dir / f'{district}_{level}s.geojson').exists()}
+OUTLINE = [effects.withStroke(linewidth=2, foreground='black')]
+
+
+def slug(text):
+    return re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')[:40]
+
+
+# 1. Every figure shown in the notebook, named after its section.
+section, count = 'start', {}
+for cell in json.load(open(notebook))['cells']:
+    if cell['cell_type'] == 'markdown':
+        heading = next((l for l in ''.join(cell['source']).splitlines() if l.startswith('## ')), None)
+        if heading:
+            section = slug(heading[3:])
+        continue
+    for output in cell.get('outputs', []):
+        data = output.get('data', {}).get('image/png')
+        if not data:
+            continue
+        count[section] = count.get(section, 0) + 1
+        image = Image.open(io.BytesIO(base64.b64decode(data))).convert('RGB')
+        name = f'{section}_{count[section]}.jpg' if count[section] > 1 or section == 'gallery' else f'{section}.jpg'
+        image.save(out_dir / name, quality=92)
+
+# 2. Full-resolution map: Sentinel-2 true colour, every pit outlined and numbered, latitude / longitude grid.
+with rasterio.open(run_dir / 'stack.tif') as src:
+    names = list(src.descriptions)             # band names were stored when downloading
+    rgb = np.stack([src.read(names.index(b) + 1) for b in ('B4', 'B3', 'B2')]).astype('float32')
+    rgb = np.where((rgb == -32768).any(axis=0), np.nan, rgb / 1e4)
+    bounds, crs = src.bounds, src.crs
+lo, hi = np.nanpercentile(rgb, [2, 98])
+rgb = np.clip(np.nan_to_num((np.transpose(rgb, (1, 2, 0)) - lo) / (hi - lo)), 0, 1)
+pits = gpd.read_file(run_dir / 'pits.gpkg').to_crs(crs) if (run_dir / 'pits.gpkg').exists() else None
+
+height, width = rgb.shape[:2]
+scale = min(1.0, 5000 / max(width, height))            # keep the JPG under ~5000 px
+fig = plt.figure(figsize=(width * scale / 100, height * scale / 100), dpi=100)
+ax = fig.add_axes([0, 0, 1, 1])
+ax.imshow(rgb, extent=(bounds.left, bounds.right, bounds.bottom, bounds.top), interpolation='nearest')
+
+# Latitude / longitude grid, drawn as curves (UTM is not aligned with degrees).
+to_utm = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+to_wgs = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
+corner_lon, corner_lat = to_wgs.transform([bounds.left, bounds.right, bounds.left, bounds.right],
+                                          [bounds.bottom, bounds.bottom, bounds.top, bounds.top])
+step = 0.05 if max(corner_lon) - min(corner_lon) > 0.3 else 0.02
+lat_span = np.linspace(min(corner_lat) - step, max(corner_lat) + step, 200)
+lon_span = np.linspace(min(corner_lon) - step, max(corner_lon) + step, 200)
+for lon in np.arange(np.ceil(min(corner_lon) / step) * step, max(corner_lon), step):
+    x, y = to_utm.transform(np.full_like(lat_span, lon), lat_span)
+    ax.plot(x, y, color='white', linewidth=0.7, alpha=0.55, linestyle='--')
+    bottom_x = np.interp(bounds.bottom + 0.01 * (bounds.top - bounds.bottom), y, x)
+    ax.text(bottom_x, bounds.bottom + 0.01 * (bounds.top - bounds.bottom), f'{lon:.2f}°E', color='white',
+            fontsize=13, ha='center', va='bottom', path_effects=OUTLINE)
+for lat in np.arange(np.ceil(min(corner_lat) / step) * step, max(corner_lat), step):
+    x, y = to_utm.transform(lon_span, np.full_like(lon_span, lat))
+    ax.plot(x, y, color='white', linewidth=0.7, alpha=0.55, linestyle='--')
+    left_y = np.interp(bounds.left + 0.005 * (bounds.right - bounds.left), x, y)
+    ax.text(bounds.left + 0.005 * (bounds.right - bounds.left), left_y, f'{lat:.2f}°N', color='white',
+            fontsize=13, ha='left', va='bottom', path_effects=OUTLINE)
+
+# Registered ponds (HSAC pond inventory) in light blue.
+if 'hsac_pond' in admin:
+    admin['hsac_pond'].to_crs(crs).boundary.plot(ax=ax, color='#00e5ff', linewidth=0.7, alpha=0.9)
+
+# Main roads and highways (OpenStreetMap) in orange; village roads are left out to keep the map readable.
+if 'road' in admin:
+    roads = admin['road'][~admin['road'].road_class.isin(['residential', 'unclassified'])].to_crs(crs)
+    roads.plot(ax=ax, color='#ffa500', linewidth=0.8, alpha=0.8)
+
+# Canals and drains (HSAC) in blue.
+if 'canal' in admin:
+    canals = admin['canal'].to_crs(crs)
+    canals[canals.geom_type.str.contains('Line')].plot(ax=ax, color='#3399ff', linewidth=0.9, alpha=0.9)
+    canals[canals.geom_type.str.contains('Polygon')].plot(ax=ax, color='#3399ff', alpha=0.5, linewidth=0)
+
+# Village (white) and tehsil (yellow) boundaries with their names.
+for level, colour, width, size, alpha in [('village', 'white', 0.6, 6, 0.75), ('tehsil', 'yellow', 3, 22, 1.0)]:
+    if level in admin:
+        layer = admin[level].to_crs(crs)
+        layer.boundary.plot(ax=ax, color=colour, linewidth=width, alpha=alpha)
+        for row in layer.itertuples():
+            point = row.geometry.representative_point()
+            label = getattr(row, level).replace(' ST', ' (sub-tehsil)') if level == 'tehsil' else getattr(row, level)
+            ax.text(point.x, point.y, label, color=colour, fontsize=size, ha='center', va='center', alpha=alpha,
+                    weight='bold' if level == 'tehsil' else 'normal', path_effects=OUTLINE)
+
+if pits is not None and len(pits):
+    colour = np.where(pits.category != 'pit', '#00aaff', np.where(pits.new_pit == 1, '#ff2020', '#ff00ff'))
+    pits.boundary.plot(ax=ax, color=colour, linewidth=0.9)
+    offset = 0.002 * (bounds.right - bounds.left)
+    for (_, p), c in zip(pits.iterrows(), colour):
+        x, y = to_utm.transform(p.longitude, p.latitude)
+        ax.text(x + offset, y + offset, str(p.pit_id), color=c, fontsize=7, path_effects=OUTLINE)
+ax.set_xlim(bounds.left, bounds.right)
+ax.set_ylim(bounds.bottom, bounds.top)
+ax.axis('off')
+n_pits = 0 if pits is None else int((pits.category == 'pit').sum())
+n_new = 0 if pits is None else int(((pits.category == 'pit') & (pits.new_pit == 1)).sum())
+excluded = pd.read_csv(run_dir / 'excluded.csv') if (run_dir / 'excluded.csv').exists() else pd.DataFrame()
+on_roads = int(excluded.category.str.startswith('on a road').sum()) if len(excluded) else 0
+in_canals = int(excluded.category.str.startswith('in a canal').sum()) if len(excluded) else 0
+n_ponds = len(excluded) - on_roads - in_canals
+ax.text(0.01, 0.99, f'{n_pits} pits ({n_new} new = red, {n_pits - n_new} older = magenta); numbers = pit_id in pits.csv '
+        f'(latitude / longitude, tehsil, village)\n'
+        f'Removed (excluded.csv): {n_ponds} ponds, {in_canals} in canals, {on_roads} on roads. Light blue = registered '
+        f'ponds (HSAC), blue = canals and drains (HSAC), orange = main roads (OSM), yellow = tehsils, white = villages '
+        f'— Sentinel-2 10 m, {run_dir.name}',
+        transform=ax.transAxes,
+        color='white', fontsize=16, va='top', linespacing=1.5,
+        bbox=dict(facecolor='black', alpha=0.65, edgecolor='none', pad=8))
+fig.savefig(out_dir / 'pit_map_full_resolution.jpg', dpi=100, pil_kwargs={'quality': 90})
+plt.close(fig)
+
+
+# 3. Coordinate tables: the new pits and the largest pits.
+def draw_table(shown, title, path, width=15):
+    fig, ax = plt.subplots(figsize=(width, 0.32 * len(shown) + 0.9))
+    ax.axis('off')
+    ax.set_title(title, fontsize=13, loc='left')
+    table = ax.table(cellText=shown.values, colLabels=shown.columns, loc='upper center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.3)
+    for (r, _), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor('#e8e8e8')
+            cell.set_text_props(weight='bold')
+    fig.savefig(path, dpi=110, bbox_inches='tight', pil_kwargs={'quality': 92})
+    plt.close(fig)
+
+
+def table_jpg(rows, title, path):
+    shown = rows[['pit_id', 'latitude', 'longitude', 'village', 'tehsil', 'area_ha', 'prob_max', 'setting']].copy()
+    shown['village'] = shown.village.fillna('')
+    shown['tehsil'] = [t if isinstance(t, str) and t else f'({d} district)' for t, d in zip(rows.tehsil, rows.district)]
+    shown['latitude'] = shown.latitude.map('{:.6f}° N'.format)
+    shown['longitude'] = shown.longitude.map('{:.6f}° E'.format)
+    shown['area_ha'] = shown.area_ha.map('{:.2f}'.format)
+    shown['prob_max'] = shown.prob_max.map('{:.2f}'.format)
+    shown.columns = ['Pit', 'Latitude', 'Longitude', 'Village', 'Tehsil', 'Area (ha)', 'Probability', 'Setting']
+    draw_table(shown, title, path)
+
+
+csv = pd.read_csv(run_dir / 'pits.csv')
+real = csv[csv.category == 'pit']
+new = real[real.new_pit == 1].sort_values('area_ha', ascending=False)
+if len(new):
+    table_jpg(new, f'New pits since this time last year ({len(new)}) — coordinates', out_dir / 'new_pits_coordinates.jpg')
+table_jpg(real.sort_values('area_ha', ascending=False).head(30), 'Largest 30 pits — coordinates',
+          out_dir / 'largest_pits_coordinates.jpg')
+if (run_dir / 'pits_by_tehsil.csv').exists():
+    by_tehsil = pd.read_csv(run_dir / 'pits_by_tehsil.csv')
+    by_tehsil.loc[len(by_tehsil)] = ['Total', by_tehsil.pits.sum(), by_tehsil.hectares.sum(), by_tehsil.new.sum()]
+    by_tehsil['hectares'] = by_tehsil.hectares.map('{:.1f}'.format)
+    by_tehsil[['pits', 'new']] = by_tehsil[['pits', 'new']].astype(int)
+    by_tehsil.columns = ['Tehsil', 'Pits', 'Area (ha)', 'New pits']
+    draw_table(by_tehsil, f'Pits by tehsil — {district.title()}', out_dir / 'pits_by_tehsil.jpg', width=8)
+
+for path in sorted(out_dir.glob('*.jpg')):
+    print(f'{path.name:45s} {Image.open(path).size}')
